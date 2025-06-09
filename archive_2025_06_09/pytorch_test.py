@@ -1,0 +1,16 @@
+import torch
+import time
+code_start_time = time.time()
+print('started...')
+print( 'torch.cuda.is_available()', torch.cuda.is_available() )
+print( 'torch.cuda.get_device_name()', torch.cuda.get_device_name() )
+print( 'torch.cuda.device_count()', torch.cuda.device_count() )
+device = torch.device('cuda')
+print( 'torch.cuda.get_device_properties()', torch.cuda.get_device_properties(device) )
+a = torch.randn( (3,5), dtype=torch.float, device=device )
+print( 'a size', a.size() )
+b = torch.rand( (5,7), dtype=torch.float, device=device )
+print( 'b size', b.size() )
+c = torch.matmul(a,b)
+print( 'c=a@b size', c.size() )
+print(f'done, time {time.time()-code_start_time:.3f}')

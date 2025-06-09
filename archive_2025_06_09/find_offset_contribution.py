@@ -1,0 +1,126 @@
+import os
+import torch
+import time
+import argparse
+import hcpdatautils as hcp
+import isingutils as ising
+
+start_time = time.time()
+
+parser = argparse.ArgumentParser(description="Load the group and individual FIM eigenvalues and eigenvectors, reconstruct the individual Ising models minus one offset, and simulate to find the FC RMSE vs original fMRI data FC.")
+
+# directories
+parser.add_argument("-d", "--data_dir", type=str, default='E:\\HCP_data', help="directory containing the structural MRI features data file")
+parser.add_argument("-s", "--stats_dir", type=str, default="E:\\Ising_model_results_daai", help="directory to which to write the output Fisher information matrices and other results")
+parser.add_argument("-p", "--fim_param_string", type=str, default='nodes_21_window_50_lr_0.000_threshold_0.100_beta_0.500_reps_1000_epoch_4', help="the part of the group FIM file name and before between 'fim_ising_' and '.pt'")
+parser.add_argument("-n", "--num_nodes", type=int, default=21, help="number of nodes in each Ising model")
+parser.add_argument("-l", "--threshold", type=float, default=0.1, help="threshold at which to binarize the fMRI data, in standard deviations above the mean")
+parser.add_argument("-b", "--beta", type=float, default=0.5, help="beta constant to use when simulating the Ising model")
+parser.add_argument("-t", "--num_steps", type=int, default=48000, help="number of steps to use when running Ising model simulations to compare FC")
+
+# We are not counting the first or last linear layer as hidden,
+# so every network has at least two layers.
+
+args = parser.parse_args()
+
+data_dir = args.data_dir
+print(f'data_dir {data_dir}')
+stats_dir = args.stats_dir
+print(f'stats_dir {stats_dir}')
+fim_param_string = args.fim_param_string
+print(f'fim_param_string {fim_param_string}')
+num_nodes = args.num_nodes
+print(f'num_nodes {num_nodes}')
+num_steps = args.num_steps
+print(f'num_steps {num_steps}')
+threshold = args.threshold
+print(f'threshold={threshold:.3g}')
+beta = args.beta
+print(f'beta {beta}')
+
+float_type = torch.float
+device = torch.device('cuda')
+
+# creates a num_rows*num_cols 1-D Tensor of booleans where each value is True if and only if it is part of the upper triangle of a flattened num_rows x num_cols matrix.
+# If we want the upper triangular part of a Tensor with one or more batch dimensions, we can flatten the last two dimensions together, and then use this.
+def get_triu_logical_index(num_rows:int, num_cols:int):
+    return ( torch.arange(start=0, end=num_rows, dtype=torch.int, device=device)[:,None] < torch.arange(start=0, end=num_cols, dtype=torch.int, device=device)[None,:] ).flatten()
+
+def get_h_and_J(params:torch.Tensor, num_nodes:int=num_nodes):
+    num_subjects, num_reps, num_params = params.size()
+    h = torch.index_select( input=params, dim=-1, index=torch.arange(end=num_nodes, device=params.device) )
+    J_flat_ut = torch.index_select( input=params, dim=-1, index=torch.arange(start=num_nodes, end=num_params, device=params.device) )
+    ut_indices = get_triu_logical_index(num_rows=num_nodes, num_cols=num_nodes).nonzero().flatten()
+    J_flat = torch.zeros( (num_subjects, num_reps, num_nodes * num_nodes), dtype=params.dtype, device=params.device )
+    J_flat.index_copy_(dim=-1, index=ut_indices, source=J_flat_ut)
+    J = J_flat.unflatten( dim=-1, sizes=(num_nodes, num_nodes) )
+    J_sym = J + J.transpose(dim0=-2, dim1=-1)
+    return h, J_sym
+
+def load_data_ts_for_fc(data_directory:str, subject_ids:list, num_nodes:int=num_nodes, threshold:torch.float=threshold):
+    num_subjects = len(subject_ids)
+    data_fc = torch.zeros( (num_subjects, num_nodes, num_nodes), dtype=float_type, device=device )
+    for subject_index in range(num_subjects):
+        subject_id = subject_ids[subject_index]
+        print(f'loaded fMRI data of subject {subject_index} of {num_subjects}, {subject_id}')
+        data_fc[subject_index,:,:] = hcp.get_fc( ising.standardize_and_binarize_ts_data( ts=hcp.load_all_time_series_for_subject(directory_path=data_directory, subject_id=subject_id, dtype=float_type, device=device), threshold=threshold, time_dim=1 ).flatten(start_dim=0, end_dim=-2)[:,:num_nodes] )
+    return data_fc
+
+def reconstruct_and_test_ising(offsets_indi:torch.Tensor, projections_group_mean:torch.Tensor, V_group:torch.Tensor, data_fc:torch.Tensor, beta:torch.float=beta, num_steps:int=num_steps, num_nodes:int=num_nodes):
+    projections_indi = projections_group_mean + offsets_indi
+    params_indi = torch.matmul( projections_indi.type(V_group.dtype), torch.linalg.inv(V_group).unsqueeze(dim=0) ).real
+    h_indi, J_indi = get_h_and_J(params=params_indi, num_nodes=num_nodes)
+    s = ising.get_random_state_like(h_indi)
+    sim_fc_indi, s = ising.run_batched_balanced_metropolis_sim_for_fc(J=J_indi, h=h_indi, s=s, num_steps=num_steps, beta=beta)
+    fc_rmse = hcp.get_triu_rmse_batch(sim_fc_indi, data_fc)
+    fc_corr = hcp.get_triu_corr_batch(sim_fc_indi, data_fc)
+    return fc_rmse, fc_corr
+
+with torch.no_grad():
+    code_start_time = time.time()
+
+    # Load group model eigenvectors.
+    V_file_name = os.path.join(stats_dir, f'V_ising_{fim_param_string}.pt')
+    V_group = torch.load(V_file_name)
+    print(f'loaded {V_file_name}, time {time.time() - code_start_time:.3f}')
+    # Load projections of the group model parameters onto the group model eigenvectors.
+    projections_group_file_name = os.path.join(stats_dir, f'projections_group_ising_{fim_param_string}.pt')
+    projections_group = torch.load(projections_group_file_name)
+    projections_group_mean = projections_group.mean(dim=0, keepdim=True).unsqueeze(dim=0)
+    print(f'loaded {projections_group_file_name}, time {time.time() - code_start_time:.3f}')
+
+    # calculations with training set individual models
+    for data_subset in ['training', 'validation', 'testing']:
+        print(f'testing effect of zeroing out individual offsets with {data_subset}..., time {time.time() - code_start_time:.3f}')
+        # Load the offsets along group model eigenvector directions.
+        offsets_indi_file_name = os.path.join(stats_dir, f'offsets_indi_{data_subset}_ising_{fim_param_string}.pt')
+        offsets_indi = torch.load(offsets_indi_file_name)
+        num_subjects, num_reps, num_offsets = offsets_indi.size()
+        print(f'loaded {offsets_indi_file_name}, time {time.time() - code_start_time:.3f}')
+        # Load and compute FCs from the subject fMRI data.
+        subject_ids = hcp.load_subject_subset(directory_path=data_dir, subject_subset=data_subset, require_sc=True)
+        print(f'loaded fMRI data time series, time {time.time() - code_start_time:.3f}')
+        data_fc = load_data_ts_for_fc(data_directory=data_dir, subject_ids=subject_ids)[:,None,:,:].repeat( (1, num_reps, 1, 1) )
+        print(f'computed FCs of {data_subset} subjects, time {time.time() - code_start_time:.3f}')
+        # Use them to reconstruct the individual Ising models.
+        # Simulate each Ising model.
+        # Compare its FC to the FC of the original fMRI data of the subject.
+        fc_rmse = torch.zeros( (num_subjects, num_reps, num_offsets+1), dtype=offsets_indi.dtype, device=offsets_indi.device )
+        fc_corr = torch.zeros_like(fc_rmse)
+        fc_rmse[:,:,-1], fc_corr[:,:,-1] = reconstruct_and_test_ising(offsets_indi=offsets_indi, projections_group_mean=projections_group_mean, V_group=V_group, data_fc=data_fc, beta=beta, num_steps=num_steps, num_nodes=num_nodes)
+        print(f'computed data-vs-sim FC of {data_subset} subjects for full Ising models, median RMSE {fc_rmse[:,:,-1].median():.3g}, median correlation {fc_corr[:,:,-1].median():.3g}, time {time.time() - code_start_time:.3f}')
+        # Repeat this process but with one offset zeroed out.
+        for offset_index in range(num_offsets):
+            offsets_indi_minus_1 = offsets_indi.clone()
+            offsets_indi_minus_1[:,:,offset_index] = 0.0
+            fc_rmse[:,:,offset_index], fc_corr[:,:,offset_index] = reconstruct_and_test_ising(offsets_indi=offsets_indi_minus_1, projections_group_mean=projections_group_mean, V_group=V_group, data_fc=data_fc, beta=beta, num_steps=num_steps, num_nodes=num_nodes)
+            print(f'computed data-vs-sim FC of {data_subset} subjects with offset {offset_index} zeroed, median RMSE {fc_rmse[:,:,offset_index].median():.3g}, median correlation {fc_corr[:,:,offset_index].median():.3g}, time {time.time() - code_start_time:.3f}')
+        # Save the results.
+        error_param_string = f'minus_offset_{fim_param_string}_steps_{num_steps}_{data_subset}'
+        fc_rmse_file = os.path.join(stats_dir, f'fc_rmse_{error_param_string}.pt')
+        torch.save(obj=fc_rmse, f=fc_rmse_file)
+        print(f'saved {fc_rmse_file}, time {time.time() - code_start_time:.3f}')
+        fc_corr_file = os.path.join(stats_dir, f'fc_corr_{error_param_string}.pt')
+        torch.save(obj=fc_corr, f=fc_corr_file)
+        print(f'saved {fc_corr_file}, time {time.time() - code_start_time:.3f}')
+    print('done')
